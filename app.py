@@ -354,156 +354,283 @@ def get_client():
 def pdf_to_base64(pdf_bytes: bytes) -> str:
     return base64.standard_b64encode(pdf_bytes).decode("utf-8")
 
+def repair_json(raw: str) -> str:
+    """Attempt to salvage truncated JSON by closing any open structures."""
+    raw = raw.strip()
+    # Strip markdown code fences
+    raw = re.sub(r"^```[a-z]*\n?", "", raw)
+    raw = re.sub(r"\n?```$", "", raw)
+    raw = raw.strip()
+
+    # Truncate at last complete top-level value if needed
+    # Count open brackets/braces to detect truncation
+    opens = 0
+    last_good = 0
+    in_string = False
+    escape_next = False
+    for i, ch in enumerate(raw):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\" and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+        if not in_string:
+            if ch in "{[":
+                opens += 1
+            elif ch in "}]":
+                opens -= 1
+                if opens == 0:
+                    last_good = i
+
+    if opens > 0 and last_good > 0:
+        # Truncated — close back to last valid point
+        raw = raw[:last_good + 1]
+        # Re-close remaining open structures
+    
+    # Try to close any still-open strings/arrays/objects
+    depth_stack = []
+    in_str = False
+    esc = False
+    for ch in raw:
+        if esc:
+            esc = False
+            continue
+        if ch == "\\" and in_str:
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+        if not in_str:
+            if ch in "{[":
+                depth_stack.append("}" if ch == "{" else "]")
+            elif ch in "}]":
+                if depth_stack:
+                    depth_stack.pop()
+
+    if in_str:
+        raw += '"'
+    for closer in reversed(depth_stack):
+        raw += closer
+
+    return raw
+
 def extract_scope_from_drawings(pdf_bytes: bytes, trades: list[str]) -> dict:
-    """Send drawing PDF to Claude, get back {trade: [scope items]} + suggested trades."""
+    """Send drawing PDF to Claude per-trade to avoid token limits."""
     client = get_client()
     if not client:
         return {}
-    
+
     b64 = pdf_to_base64(pdf_bytes)
-    trades_str = ", ".join(trades)
-    
-    prompt = f"""You are a senior construction estimator reviewing architectural and engineering drawings.
+    result = {"trades": {}, "suggested_trades": []}
+    suggested_done = False
 
-Analyze these construction drawings and do the following:
+    progress = st.progress(0, text="Starting scope extraction…")
 
-1. For each of these trades: {trades_str}
-   — Extract a detailed list of required scope items (materials, systems, specifications)
-   — Be specific: include dimensions, quantities where visible, product types, finishes
+    for i, trade in enumerate(trades):
+        pct = int((i / len(trades)) * 90)
+        progress.progress(pct, text=f"Extracting scope: {trade} ({i+1}/{len(trades)})…")
 
-2. Additionally, suggest any OTHER trades that appear required based on the drawings but are NOT in the list above.
+        prompt = f"""You are a senior construction estimator reviewing architectural and engineering drawings.
 
-Respond ONLY with valid JSON in this exact format:
+Focus ONLY on the {trade} trade.
+
+Extract every required scope item for {trade} visible in these drawings.
+Be specific: include materials, product types, finishes, dimensions, quantities where shown.
+
+Respond ONLY with valid JSON — no explanation, no markdown fences:
 {{
-  "trades": {{
-    "TradeNameExact": [
-      "Scope item 1",
-      "Scope item 2"
-    ]
-  }},
+  "scope_items": [
+    "Scope item 1",
+    "Scope item 2",
+    "Scope item 3"
+  ]
+}}
+
+Keep each item concise (under 15 words). Return 5–25 items. If {trade} has no visible scope, return an empty array."""
+
+        try:
+            response = client.messages.create(
+                model="claude-opus-4-6",
+                max_tokens=2000,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": b64,
+                            }
+                        },
+                        {"type": "text", "text": prompt}
+                    ]
+                }]
+            )
+            raw = response.content[0].text.strip()
+            raw = repair_json(raw)
+            parsed = json.loads(raw)
+            result["trades"][trade] = parsed.get("scope_items", [])
+        except json.JSONDecodeError as e:
+            st.warning(f"⚠ Could not parse scope for {trade} — you can add it manually. ({e})")
+            result["trades"][trade] = []
+        except Exception as e:
+            st.warning(f"⚠ API error on {trade}: {e}")
+            result["trades"][trade] = []
+
+    # One final call for suggested trades (lightweight)
+    progress.progress(92, text="Checking for additional required trades…")
+    trades_str = ", ".join(trades)
+    suggest_prompt = f"""You are a construction estimator reviewing drawings.
+
+The following trades are already defined: {trades_str}
+
+Based on these drawings, list any OTHER trades that appear required but are NOT in the list above.
+Keep it to 1–5 suggestions maximum. If none, return an empty array.
+
+Respond ONLY with valid JSON:
+{{
   "suggested_trades": [
     {{
       "name": "Trade Name",
-      "reason": "Why this trade is needed",
+      "reason": "One sentence why",
       "scope_items": ["item 1", "item 2"]
+    }}
+  ]
+}}"""
+    try:
+        resp2 = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=800,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {"type": "base64", "media_type": "application/pdf", "data": b64}
+                    },
+                    {"type": "text", "text": suggest_prompt}
+                ]
+            }]
+        )
+        raw2 = repair_json(resp2.content[0].text.strip())
+        parsed2 = json.loads(raw2)
+        result["suggested_trades"] = parsed2.get("suggested_trades", [])
+    except Exception:
+        result["suggested_trades"] = []
+
+    progress.progress(100, text="✓ Scope extraction complete!")
+    progress.empty()
+    return result
+
+def parse_bid_pdf(pdf_bytes: bytes, trade: str, master_scope: list[str], sub_name: str) -> dict:
+    """Extract bid data from a subcontractor PDF — two-pass for reliability."""
+    client = get_client()
+    if not client:
+        return {}
+
+    b64 = pdf_to_base64(pdf_bytes)
+    scope_list = "\n".join(f"- {item}" for item in master_scope) if master_scope else "No master scope defined."
+
+    prompt1 = f"""You are a construction bid analyst. Review this subcontractor bid for the {trade} trade.
+
+Extract the following and respond ONLY with valid compact JSON (no markdown, no explanation):
+{{
+  "subcontractor_name": "{sub_name}",
+  "total_price": 0,
+  "inclusions": ["item1", "item2"],
+  "exclusions": ["item1"],
+  "key_notes": ["note1"],
+  "bid_confidence": "HIGH",
+  "bid_confidence_reason": "reason here"
+}}
+
+Rules:
+- total_price must be a plain number (no $ or commas)
+- Keep each inclusion/exclusion under 12 words
+- Maximum 20 inclusions, 10 exclusions, 5 notes
+- bid_confidence = HIGH if scope is clear and complete, MEDIUM if some ambiguity, LOW if vague"""
+
+    prompt2_template = """You are a construction estimator doing gap analysis for a {trade} bid.
+
+MASTER SCOPE (required items):
+{scope_list}
+
+SUBCONTRACTOR INCLUSIONS (what they said they included):
+{inclusions_text}
+
+Identify every Master Scope item that is NOT clearly covered by the inclusions above.
+Respond ONLY with valid compact JSON (no markdown):
+{{
+  "gaps": [
+    {{
+      "master_scope_item": "exact item from master scope",
+      "risk": "HIGH",
+      "estimated_value": "$5,000 or Unknown",
+      "note": "Brief reason this matters"
     }}
   ]
 }}
 
-Use the exact trade names as provided. If a trade has no visible scope in the drawings, return an empty array for it.
-Be thorough. A missed scope item becomes a change order."""
+If all items are covered, return {{"gaps": []}}
+Risk: HIGH = definite change order, MEDIUM = worth clarifying, LOW = minor item"""
 
-    try:
-        response = client.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=4000,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": b64,
-                        }
-                    },
-                    {"type": "text", "text": prompt}
-                ]
-            }]
-        )
-        raw = response.content[0].text.strip()
-        # Strip markdown code fences if present
-        raw = re.sub(r"^```[a-z]*\n?", "", raw)
-        raw = re.sub(r"\n?```$", "", raw)
-        return json.loads(raw)
-    except json.JSONDecodeError as e:
-        st.error(f"AI returned invalid JSON: {e}")
-        return {}
-    except Exception as e:
-        st.error(f"API error: {e}")
-        return {}
-
-def parse_bid_pdf(pdf_bytes: bytes, trade: str, master_scope: list[str], sub_name: str) -> dict:
-    """Extract bid data from a subcontractor PDF."""
-    client = get_client()
-    if not client:
-        return {}
-    
-    b64 = pdf_to_base64(pdf_bytes)
-    scope_list = "\n".join(f"- {item}" for item in master_scope) if master_scope else "No master scope defined."
-    
-    prompt = f"""You are a construction bid analyst reviewing a subcontractor bid for the {trade} trade.
-
-MASTER SCOPE (the required items for this trade):
-{scope_list}
-
-Analyze this bid document and extract:
-1. The total bid price (numeric, USD)
-2. All explicit inclusions mentioned
-3. All explicit exclusions mentioned
-4. Compare EVERY item in the Master Scope against the inclusions — identify what is MISSING (gaps)
-5. Key notes, clarifications, or assumptions
-
-Respond ONLY with valid JSON:
-{{
-  "subcontractor_name": "{sub_name}",
-  "total_price": 0,
-  "price_display": "$0",
-  "inclusions": [
-    "Included item 1",
-    "Included item 2"
-  ],
-  "exclusions": [
-    "Excluded item 1"
-  ],
-  "gaps": [
-    {{
-      "master_scope_item": "Missing item from master scope",
-      "risk": "HIGH|MEDIUM|LOW",
-      "estimated_value": "Rough cost estimate or Unknown",
-      "note": "Why this matters"
+    result = {{
+        "subcontractor_name": sub_name,
+        "total_price": 0,
+        "inclusions": [],
+        "exclusions": [],
+        "key_notes": [],
+        "bid_confidence": "MEDIUM",
+        "bid_confidence_reason": "",
+        "gaps": [],
     }}
-  ],
-  "key_notes": [
-    "Clarification or assumption 1"
-  ],
-  "bid_confidence": "HIGH|MEDIUM|LOW",
-  "bid_confidence_reason": "Why you scored it this way"
-}}
-
-Be precise. A gap = something in the master scope that is NOT clearly included in this bid.
-For risk: HIGH = likely major change order, MEDIUM = worth discussing, LOW = minor/admin."""
 
     try:
-        response = client.messages.create(
+        r1 = client.messages.create(
             model="claude-opus-4-6",
             max_tokens=3000,
-            messages=[{
+            messages=[{{
                 "role": "user",
                 "content": [
-                    {
-                        "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": b64,
-                        }
-                    },
-                    {"type": "text", "text": prompt}
+                    {{"type": "document", "source": {{"type": "base64", "media_type": "application/pdf", "data": b64}}}},
+                    {{"type": "text", "text": prompt1}}
                 ]
-            }]
+            }}]
         )
-        raw = response.content[0].text.strip()
-        raw = re.sub(r"^```[a-z]*\n?", "", raw)
-        raw = re.sub(r"\n?```$", "", raw)
-        return json.loads(raw)
+        raw1 = repair_json(r1.content[0].text.strip())
+        p1 = json.loads(raw1)
+        result.update({{k: p1[k] for k in p1 if k in result}})
     except json.JSONDecodeError as e:
-        st.error(f"Bid parse error (invalid JSON): {e}")
-        return {}
+        st.warning(f"\u26a0 Pass 1 parse issue — partial data saved. ({{e}})")
     except Exception as e:
-        st.error(f"API error parsing bid: {e}")
-        return {}
+        st.error(f"API error (pass 1): {{e}}")
+        return result
+
+    try:
+        inclusions_text = "\n".join(f"- {{i}}" for i in result.get("inclusions", [])) or "None stated"
+        p2_prompt = prompt2_template.format(
+            trade=trade,
+            scope_list=scope_list,
+            inclusions_text=inclusions_text
+        )
+        r2 = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=2000,
+            messages=[{{"role": "user", "content": [{{"type": "text", "text": p2_prompt}}]}}]
+        )
+        raw2 = repair_json(r2.content[0].text.strip())
+        p2 = json.loads(raw2)
+        result["gaps"] = p2.get("gaps", [])
+    except json.JSONDecodeError as e:
+        st.warning(f"\u26a0 Gap analysis parse issue — gaps may be incomplete. ({{e}})")
+    except Exception as e:
+        st.warning(f"\u26a0 Gap analysis error: {{e}}")
+
+    return result
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FORMATTING HELPERS
